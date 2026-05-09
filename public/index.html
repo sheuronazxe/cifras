@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Cifras y Letras</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header class="top-header">
+        <h1>
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" class="header-logo">
+                <rect x="10" y="10" width="36" height="36" rx="8" fill="currentColor" opacity="0.3" />
+                <text x="28" y="36" font-family="sans-serif" font-weight="800" font-size="24" fill="currentColor"
+                    text-anchor="middle">A</text>
+                <rect x="54" y="10" width="36" height="36" rx="8" fill="currentColor" />
+                <text x="72" y="36" font-family="sans-serif" font-weight="800" font-size="24" fill="#F0F4F8"
+                    text-anchor="middle">7</text>
+                <rect x="10" y="54" width="36" height="36" rx="8" fill="currentColor" />
+                <path d="M 21 72 L 35 72 M 28 65 L 28 79" stroke="#F0F4F8" stroke-width="4" stroke-linecap="round" />
+                <rect x="54" y="54" width="36" height="36" rx="8" fill="currentColor" opacity="0.3" />
+                <text x="72" y="80" font-family="sans-serif" font-weight="800" font-size="24" fill="currentColor"
+                    text-anchor="middle">Z</text>
+            </svg>
+            Cifras y Letras
+        </h1>
+        <div class="header-right">
+            <div id="connection-status" class="connection-badge disconnected">Desconectado</div>
+            <button id="header-btn-sound" class="header-btn" title="Sonido">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                    stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round"
+                        d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M15 12H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+            </button>
+        </div>
+    </header>
+
+    <div id="login-screen" class="screen">
+        <div class="panel login-panel">
+            <h1>Cifras y Letras</h1>
+            <h2>Demuestra tu agilidad mental</h2>
+            <form id="login-form">
+                <input type="text" id="username" placeholder="Tu nombre" maxlength="20" autocomplete="username" autofocus>
+                <button type="submit" id="join-btn" class="btn primary">Entrar</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="game-screen" class="screen hidden">
+        <div class="layout">
+            <div class="main-content">
+                <div id="controls-panel" class="controls panel">
+                    <div id="toast" class="toast"></div>
+                    <div id="welcome-panel" class="welcome-panel">
+                        <h2 class="welcome-title">Bienvenido</h2>
+                        <div class="welcome-modes">
+                            <div class="welcome-mode">
+                                <h3>Cifras</h3>
+                                <p>Alcanza el número objetivo combinando 6 números. 10 puntos si lo logras exacto!</p>
+                            </div>
+                            <div class="welcome-mode">
+                                <h3>Letras</h3>
+                                <p>Forma la palabra mas larga con las 10 letras. 1 punto por letra!</p>
+                            </div>
+                        </div>
+                    </div>
+                    <button id="ready-btn" class="btn success">Estoy Listo</button>
+
+                    <div id="choosing-panel" class="hidden">
+                        <p id="choosing-subtitle">Esperando a que el jugador elija...</p>
+                        <div id="chooser-controls" class="hidden">
+                            <p>Cuantas vocales quieres?</p>
+                            <div class="vowel-buttons">
+                                <button class="btn primary vowel-btn" data-vowels="3">3 Vocales</button>
+                                <button class="btn primary vowel-btn" data-vowels="4">4 Vocales</button>
+                                <button class="btn primary vowel-btn" data-vowels="5">5 Vocales</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="game-board" class="hidden">
+                        <div id="numbers-board" class="hidden cifras-layout">
+                            <div class="cifras-top-row">
+                                <div class="cifras-target panel">
+                                    <div class="label-target">OBJETIVO</div>
+                                    <div id="cifras-target-value" class="value-target">---</div>
+                                </div>
+                                <div class="expression-display" id="expression-display">
+                                    <button id="btn-clear" class="btn-clear-postit">BORRAR</button>
+                                    <div id="expression-content" class="expression-content">
+                                        <div class="placeholder">Selecciona dos números y una operación</div>
+                                    </div>
+                                </div>
+                                <div class="cifras-timer panel">
+                                    <div class="label-timer">TIEMPO</div>
+                                    <div id="cifras-timer-value" class="value-timer">50</div>
+                                </div>
+                            </div>
+                            <div class="cifras-originals">
+                                <span id="elements-label">Cifras iniciales:</span>
+                                <div id="original-numbers" class="original-numbers"></div>
+                            </div>
+                            <div id="numbers-keypad" class="numbers-keypad"></div>
+                            <div class="cifras-ops-row">
+                                <button class="keypad-btn op-btn" data-val="+"><span>+</span></button>
+                                <button class="keypad-btn op-btn" data-val="-"><span>-</span></button>
+                                <button class="keypad-btn op-btn" data-val="*"><span>&times;</span></button>
+                                <button class="keypad-btn op-btn" data-val="/"><span>&divide;</span></button>
+                                <button id="btn-backspace" class="keypad-btn action-btn"><span>Atras</span></button>
+                            </div>
+                        </div>
+
+                        <div id="letters-board" class="hidden">
+                            <div class="letras-layout">
+                                <div class="letras-top-row">
+                                    <div class="letras-target panel">
+                                        <div class="label-target">MI PALABRA</div>
+                                        <div id="letras-target-value" class="value-target">---</div>
+                                    </div>
+                                    <div class="letras-timer panel">
+                                        <div class="label-timer">TIEMPO</div>
+                                        <div id="letras-timer-value" class="value-timer">50</div>
+                                    </div>
+                                </div>
+                                <div class="expression-display" id="word-display">
+                                    <button id="btn-letters-clear" class="btn-clear-postit">BORRAR</button>
+                                    <div class="expression-content">
+                                        <div class="placeholder">Selecciona letras</div>
+                                    </div>
+                                </div>
+                                <div id="letters-keypad" class="letters-keypad"></div>
+                                <div class="letras-actions">
+                                    <button id="btn-letters-backspace"
+                                        class="keypad-btn action-btn"><span>Atras</span></button>
+                                    <button id="submit-word-btn"
+                                        class="keypad-btn action-btn success"><span>Enviar</span></button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="winner-banner" class="winner-banner hidden panel">
+                        <div class="winner-main-info">
+                            <p id="winner-text"></p>
+                            <div id="winner-steps" class="winner-steps"></div>
+                        </div>
+                        <div id="winner-side-panel" class="winner-side-panel hidden"></div>
+                    <button id="next-round-btn" class="btn success" style="margin-top:1.5rem">Siguiente Ronda</button>
+                </div>
+            </div>
+
+            <aside class="right-sidebar">
+                <section>
+                    <h3><svg width="16" height="16" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
+                            stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                        </svg>Jugadores</h3>
+                    <ul id="players-list"></ul>
+                </section>
+                <section>
+                    <h3><svg width="16" height="16" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"
+                            stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+                        </svg>Ranking</h3>
+                    <ul id="ranking-list">
+                        <li class="empty-state">Sin victorias aun</li>
+                    </ul>
+                </section>
+                <div class="sidebar-footer">@sheuronazxe</div>
+            </aside>
+        </div>
+
+        <script src="app.js"></script>
+    </div>
+</body>
+
+</html>
