@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -14,10 +15,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,6 +26,16 @@ import (
 // ─────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────
+
+const (
+	StatusWaiting  = "waiting"
+	StatusChoosing = "choosing"
+	StatusPlaying  = "playing"
+	StatusFinished = "finished"
+
+	RoundCifras = "cifras"
+	RoundLetras = "letras"
+)
 
 const (
 	NumbersRoundDuration = 50 * time.Second
@@ -38,6 +49,9 @@ const (
 	ReadTimeout          = 60 * time.Second
 	PingInterval         = 30 * time.Second
 	PingTimeout          = 5 * time.Second
+	SolverMaxSteps       = 5_000_000
+	MaxSubmissionSteps   = 20
+	AlphabetSize         = 27 // a-z + ñ
 )
 
 // ─────────────────────────────────────────────
@@ -52,6 +66,13 @@ type Client struct {
 	sendCh chan Message
 }
 
+func (c *Client) send(msg Message) {
+	select {
+	case c.sendCh <- msg:
+	default:
+	}
+}
+
 type PlayerResult struct {
 	Name        string `json:"name"`
 	FinalNumber int    `json:"finalNumber,omitempty"`
@@ -62,7 +83,7 @@ type PlayerResult struct {
 
 type GameState struct {
 	RoundType          string         `json:"roundType"`
-	Status             string         `json:"status"` // waiting, choosing, playing, finished
+	Status             string         `json:"status"`
 	Chooser            string         `json:"chooser,omitempty"`
 	Target             int            `json:"target,omitempty"`
 	Numbers            []int          `json:"numbers,omitempty"`
@@ -73,7 +94,7 @@ type GameState struct {
 	ExactSolutionSteps []string       `json:"exactSolutionSteps,omitempty"`
 	EndTime            int64          `json:"endTime"`
 	ServerNow          int64          `json:"serverNow"`
-	Rankings           map[string]int `json:"rankings"` // used as scores now
+	Rankings           map[string]int `json:"rankings"`
 	OtherResults       []PlayerResult `json:"otherResults,omitempty"`
 	TotalRounds        int            `json:"totalRounds"`
 }
@@ -90,8 +111,8 @@ type Submission struct {
 type DictEntry struct {
 	original string
 	word     string
-	freq     [27]int
-	runes    int
+	freq     [AlphabetSize]int
+	length   int
 }
 
 type PlayerInfo struct {
@@ -127,7 +148,7 @@ var (
 	clientsMu sync.RWMutex
 
 	gameState = GameState{
-		Status:   "waiting",
+		Status:   StatusWaiting,
 		Rankings: make(map[string]int),
 	}
 	gameMu sync.RWMutex
@@ -135,22 +156,33 @@ var (
 	roundTimer       *time.Timer
 	chooserTimer     *time.Timer
 	readyTimer       *time.Timer
+	timerMu          sync.Mutex
+	roundStarting    bool
+	roundStartMu     sync.Mutex
 	roundSubmissions = make(map[*Client]Submission)
 	submissionMu     sync.Mutex
 
 	stepRegex = regexp.MustCompile(`^(\d+)\s*([+\-*/])\s*(\d+)\s*=\s*(\d+)$`)
 
-	dictionary map[string]string // normalized -> original
-	sortedDict []DictEntry
-	turnIndex  = 0
+	dictionary map[string]string
+	sortedDict     []DictEntry
+	dictByLength   [11][]int // length -> indices in sortedDict
+	nextChooserIndex = 0
 )
 
-func init() {
+var normalizeReplacer = strings.NewReplacer(
+	"á", "a", "é", "e", "í", "i", "ó", "o", "ú", "u", "ü", "u",
+)
+
+// ─────────────────────────────────────────────
+// Dictionary Loading
+// ─────────────────────────────────────────────
+
+func loadDictionary() error {
 	dictionary = make(map[string]string)
 	f, err := os.Open("assets/diccionario.txt")
 	if err != nil {
-		log.Println("Advertencia: No se pudo cargar diccionario.txt:", err)
-		return
+		return fmt.Errorf("abrir diccionario: %w", err)
 	}
 	defer f.Close()
 
@@ -172,8 +204,12 @@ func init() {
 			rawWords = append(rawWords, norm)
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("leer diccionario: %w", err)
+	}
 	buildSortedDict(rawWords)
 	log.Printf("Diccionario cargado con %d palabras (%d válidas para búsqueda)", len(dictionary), len(sortedDict))
+	return nil
 }
 
 func buildSortedDict(rawWords []string) {
@@ -183,7 +219,7 @@ func buildSortedDict(rawWords []string) {
 		if len(runes) < 5 {
 			continue
 		}
-		var freq [27]int
+		var freq [AlphabetSize]int
 		valid := true
 		for _, r := range runes {
 			idx := runeIndex(r)
@@ -199,21 +235,38 @@ func buildSortedDict(rawWords []string) {
 		}
 	}
 	sort.Slice(sortedDict, func(i, j int) bool {
-		return sortedDict[i].runes > sortedDict[j].runes
+		return sortedDict[i].length > sortedDict[j].length
 	})
+
+	// Build index by length
+	for i := range dictByLength {
+		dictByLength[i] = nil
+	}
+	for idx, entry := range sortedDict {
+		if entry.length >= 5 && entry.length <= 10 {
+			dictByLength[entry.length] = append(dictByLength[entry.length], idx)
+		}
+	}
 }
 
-var normalizeReplacer = strings.NewReplacer(
-	"á", "a", "é", "e", "í", "i", "ó", "o", "ú", "u", "ü", "u",
-)
+var asciiIndex [128]int
+
+func init() {
+	for i := range asciiIndex {
+		asciiIndex[i] = -1
+	}
+	for c := 'a'; c <= 'z'; c++ {
+		asciiIndex[c] = int(c - 'a')
+	}
+}
 
 func normalizeWord(w string) string {
 	return normalizeReplacer.Replace(strings.ToLower(w))
 }
 
 func runeIndex(r rune) int {
-	if r >= 'a' && r <= 'z' {
-		return int(r - 'a')
+	if r < 128 {
+		return asciiIndex[r]
 	}
 	if r == 'ñ' {
 		return 26
@@ -221,11 +274,27 @@ func runeIndex(r rune) int {
 	return -1
 }
 
+func letterFrequency(letters []string) [AlphabetSize]int {
+	var freq [AlphabetSize]int
+	for _, l := range letters {
+		for _, r := range normalizeWord(l) {
+			if idx := runeIndex(r); idx >= 0 {
+				freq[idx]++
+			}
+		}
+	}
+	return freq
+}
+
 // ─────────────────────────────────────────────
 // Entry Point
 // ─────────────────────────────────────────────
 
 func main() {
+	if err := loadDictionary(); err != nil {
+		log.Fatalf("Error cargando diccionario: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.Dir("./public")))
 	mux.HandleFunc("/ws", handleConnections)
@@ -291,16 +360,17 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clients[client] = true
+	totalClients := len(clients)
 	clientsMu.Unlock()
 
-	log.Printf("🔌 Cliente conectado desde %s (total: %d)", r.RemoteAddr, len(clients))
+	log.Printf("🔌 Cliente conectado desde %s (total: %d)", r.RemoteAddr, totalClients)
 
 	gameMu.RLock()
 	st := gameState
 	st.ServerNow = time.Now().Unix()
 	gameMu.RUnlock()
 
-	sendJSON(client, Message{Type: "state", State: st})
+	client.send(Message{Type: "state", State: st})
 
 	broadcastPlayers()
 	go pingLoop(client)
@@ -353,7 +423,7 @@ func handleMessages(client *Client) {
 		case "vowels":
 			handleVowels(client, msg.Vowels)
 		default:
-			sendJSON(client, Message{Type: "error", Error: "Tipo de mensaje desconocido"})
+			client.send(Message{Type: "error", Error: "Tipo de mensaje desconocido"})
 		}
 	}
 }
@@ -364,9 +434,10 @@ func cleanupClient(client *Client) {
 
 	clientsMu.Lock()
 	delete(clients, client)
+	remainingClients := len(clients)
 	clientsMu.Unlock()
 
-	log.Printf("🔌 Cliente '%s' desconectado (total: %d)", client.name, len(clients))
+	log.Printf("🔌 Cliente '%s' desconectado (total: %d)", client.name, remainingClients)
 
 	submissionMu.Lock()
 	delete(roundSubmissions, client)
@@ -377,17 +448,12 @@ func cleanupClient(client *Client) {
 	gameMu.Lock()
 	defer gameMu.Unlock()
 
-	clientsMu.RLock()
-	count := len(clients)
-	clientsMu.RUnlock()
-
 	switch gameState.Status {
-	case "choosing":
-		if count == 0 {
+	case StatusChoosing:
+		if remainingClients == 0 {
 			resetGameState()
 			return
 		}
-		// If the chooser disconnected, reassign to another player
 		if client.name == gameState.Chooser {
 			clientsMu.RLock()
 			var newChooser *Client
@@ -403,20 +469,31 @@ func cleanupClient(client *Client) {
 				broadcast(Message{Type: "state", State: st})
 			}
 		}
-	case "playing":
-		if count == 0 && roundTimer != nil {
-			roundTimer.Stop()
-			roundTimer = nil
+	case StatusPlaying:
+		if remainingClients == 0 {
+			timerMu.Lock()
+			if roundTimer != nil {
+				roundTimer.Stop()
+				roundTimer = nil
+			}
+			timerMu.Unlock()
 			resetGameState()
 		}
-	case "waiting", "finished":
+	case StatusFinished:
+		if remainingClients == 0 {
+			resetGameState()
+			return
+		}
+		go checkAllReady()
+	case StatusWaiting:
 		go checkAllReady()
 	}
 }
 
 func resetGameState() {
-	gameState.Status = "waiting"
+	gameState.Status = StatusWaiting
 	gameState.RoundType = ""
+	gameState.Chooser = ""
 	gameState.Numbers = nil
 	gameState.Letters = nil
 	gameState.Solution = ""
@@ -424,6 +501,8 @@ func resetGameState() {
 	gameState.SolutionSteps = nil
 	gameState.ExactSolutionSteps = nil
 	gameState.EndTime = 0
+	gameState.TotalRounds = 0
+	gameState.Rankings = make(map[string]int)
 }
 
 // ─────────────────────────────────────────────
@@ -456,7 +535,7 @@ func handleJoin(client *Client, msg Message) {
 	client.name = name
 	clientsMu.Unlock()
 
-	log.Printf("👤 Jugador '%s' se unió (estado: %s)", name, gameState.Status)
+	log.Printf("👤 Jugador '%s' se unió", name)
 	broadcastPlayers()
 }
 
@@ -486,7 +565,7 @@ func handleReady(client *Client) {
 	status := gameState.Status
 	gameMu.RUnlock()
 
-	if status != "waiting" && status != "finished" {
+	if status != StatusWaiting && status != StatusFinished {
 		return
 	}
 
@@ -494,7 +573,7 @@ func handleReady(client *Client) {
 	client.ready = true
 	clientsMu.Unlock()
 
-	log.Printf("✅ Jugador '%s' está listo (estado: %s)", client.name, gameState.Status)
+	log.Printf("✅ Jugador '%s' está listo (estado: %s)", client.name, status)
 	broadcastPlayers()
 	checkAllReady()
 }
@@ -516,14 +595,17 @@ func checkAllReady() {
 	}
 
 	if allReady {
+		timerMu.Lock()
 		if readyTimer != nil {
 			readyTimer.Stop()
 			readyTimer = nil
 		}
+		timerMu.Unlock()
 		go startNewRound()
 		return
 	}
 
+	timerMu.Lock()
 	if readyTimer == nil {
 		readyTimer = time.AfterFunc(ReadyTimeout, func() {
 			clientsMu.RLock()
@@ -534,6 +616,7 @@ func checkAllReady() {
 			}
 		})
 	}
+	timerMu.Unlock()
 }
 
 // ─────────────────────────────────────────────
@@ -541,13 +624,29 @@ func checkAllReady() {
 // ─────────────────────────────────────────────
 
 func startNewRound() {
+	roundStartMu.Lock()
+	if roundStarting {
+		roundStartMu.Unlock()
+		return
+	}
+	roundStarting = true
+	roundStartMu.Unlock()
+
+	defer func() {
+		roundStartMu.Lock()
+		roundStarting = false
+		roundStartMu.Unlock()
+	}()
+
+	timerMu.Lock()
 	if readyTimer != nil {
 		readyTimer.Stop()
 		readyTimer = nil
 	}
+	timerMu.Unlock()
 
 	gameMu.Lock()
-	if gameState.Status != "waiting" && gameState.Status != "finished" {
+	if gameState.Status != StatusWaiting && gameState.Status != StatusFinished {
 		gameMu.Unlock()
 		return
 	}
@@ -567,9 +666,11 @@ func startNewRound() {
 	submissionMu.Unlock()
 
 	gameMu.Lock()
+	timerMu.Lock()
 	if roundTimer != nil {
 		roundTimer.Stop()
 	}
+	timerMu.Unlock()
 
 	gameState.TotalRounds++
 	gameState.Winner = ""
@@ -579,8 +680,8 @@ func startNewRound() {
 	gameState.OtherResults = nil
 
 	if gameState.TotalRounds%2 == 1 {
-		gameState.RoundType = "cifras"
-		gameState.Status = "playing"
+		gameState.RoundType = RoundCifras
+		gameState.Status = StatusPlaying
 		gameState.Numbers = generateNumbers()
 		gameState.Target = rand.IntN(899) + 101
 		gameState.Letters = nil
@@ -589,33 +690,32 @@ func startNewRound() {
 		gameState.EndTime = now.Add(NumbersRoundDuration).Unix()
 		gameState.ServerNow = now.Unix()
 
+		timerMu.Lock()
 		roundTimer = time.AfterFunc(NumbersRoundDuration, timeOutRound)
+		timerMu.Unlock()
 
 		log.Printf("🎮 Ronda #%d CIFRAS iniciada - Objetivo: %d - Números: %v", gameState.TotalRounds, gameState.Target, gameState.Numbers)
 	} else {
-		gameState.RoundType = "letras"
-		gameState.Status = "choosing"
+		gameState.RoundType = RoundLetras
+		gameState.Status = StatusChoosing
 		gameState.Numbers = nil
 		gameState.Target = 0
 
 		sort.Slice(players, func(i, j int) bool { return players[i].name < players[j].name })
-		chooser := players[turnIndex%len(players)]
-		turnIndex++
+		chooser := players[nextChooserIndex%len(players)]
+		nextChooserIndex++
 		gameState.Chooser = chooser.name
 		gameState.EndTime = 0
 		gameState.ServerNow = time.Now().Unix()
 
+		timerMu.Lock()
 		if chooserTimer != nil {
 			chooserTimer.Stop()
 		}
 		chooserTimer = time.AfterFunc(ChooserTimeout, timeoutChooser)
+		timerMu.Unlock()
 
 		log.Printf("🎮 Ronda #%d LETRAS iniciada - Chooser: %s (%d jugadores)", gameState.TotalRounds, chooser.name, len(players))
-
-		if chooserTimer != nil {
-			chooserTimer.Stop()
-		}
-		chooserTimer = time.AfterFunc(ChooserTimeout, timeoutChooser)
 	}
 
 	st := gameState
@@ -628,7 +728,7 @@ func handleVowels(client *Client, count int) {
 	gameMu.Lock()
 	defer gameMu.Unlock()
 
-	if gameState.Status != "choosing" || gameState.RoundType != "letras" {
+	if gameState.Status != StatusChoosing || gameState.RoundType != RoundLetras {
 		return
 	}
 	if client.name != gameState.Chooser {
@@ -636,29 +736,53 @@ func handleVowels(client *Client, count int) {
 	}
 
 	count = max(3, min(5, count))
+	startLettersRound(count)
+}
 
-	vowels := getVowels(count)
-	consonants := getConsonants(10 - count)
-	
-	letters := append(vowels, consonants...)
+func timeoutChooser() {
+	gameMu.Lock()
+	defer gameMu.Unlock()
+
+	if gameState.Status != StatusChoosing || gameState.RoundType != RoundLetras {
+		return
+	}
+
+	vowelCount := rand.IntN(3) + 3
+	startLettersRound(vowelCount)
+}
+
+// startLettersRound begins the letters playing phase. Caller must hold gameMu.Lock.
+func startLettersRound(vowelCount int) {
+	vowels := getVowels(vowelCount)
+	consonants := getConsonants(10 - vowelCount)
+
+	// Create a new slice to avoid aliasing the backing arrays of vowels/consonants
+	letters := make([]string, 0, 10)
+	letters = append(letters, vowels...)
+	letters = append(letters, consonants...)
 	shuffleSlice(letters)
 
 	gameState.Letters = letters
-	gameState.Status = "playing"
+	gameState.Status = StatusPlaying
 	now := time.Now()
 	gameState.EndTime = now.Add(LettersRoundDuration).Unix()
 	gameState.ServerNow = now.Unix()
 
+	timerMu.Lock()
 	if chooserTimer != nil {
 		chooserTimer.Stop()
 		chooserTimer = nil
 	}
+	if roundTimer != nil {
+		roundTimer.Stop()
+	}
 	roundTimer = time.AfterFunc(LettersRoundDuration, timeOutRound)
-	st := gameState
+	timerMu.Unlock()
 
+	st := gameState
 	broadcast(Message{Type: "state", State: st})
 
-	log.Printf("🎮 Ronda #%d LETRAS iniciada - Letras: %v", gameState.TotalRounds, letters)
+	log.Printf("🎮 Ronda #%d LETRAS - Letras: %v", gameState.TotalRounds, letters)
 }
 
 func shuffleSlice[T any](s []T) {
@@ -693,7 +817,7 @@ func generateNumbers() []int {
 
 func timeOutRound() {
 	gameMu.RLock()
-	if gameState.Status != "playing" {
+	if gameState.Status != StatusPlaying {
 		gameMu.RUnlock()
 		return
 	}
@@ -704,43 +828,13 @@ func timeOutRound() {
 	})
 }
 
-func timeoutChooser() {
-	gameMu.Lock()
-	defer gameMu.Unlock()
-
-	if gameState.Status != "choosing" || gameState.RoundType != "letras" {
-		return
-	}
-
-	vowelCount := rand.IntN(3) + 3
-	vowels := getVowels(vowelCount)
-	consonants := getConsonants(10 - vowelCount)
-
-	letters := append(vowels, consonants...)
-	shuffleSlice(letters)
-
-	gameState.Letters = letters
-	gameState.Status = "playing"
-	now := time.Now()
-	gameState.EndTime = now.Add(LettersRoundDuration).Unix()
-	gameState.ServerNow = now.Unix()
-
-	if roundTimer != nil {
-		roundTimer.Stop()
-	}
-	roundTimer = time.AfterFunc(LettersRoundDuration, timeOutRound)
-
-	st := gameState
-	broadcast(Message{Type: "state", State: st})
-}
-
 func finishRound() {
 	gameMu.Lock()
-	if gameState.Status != "playing" {
+	if gameState.Status != StatusPlaying {
 		gameMu.Unlock()
 		return
 	}
-	gameState.Status = "finished"
+	gameState.Status = StatusFinished
 	gameMu.Unlock()
 
 	clientsMu.Lock()
@@ -750,25 +844,30 @@ func finishRound() {
 	clientsMu.Unlock()
 	broadcastPlayers()
 
+	// Copy submissions under lock, then release before acquiring gameMu.
+	// This avoids holding submissionMu while locking gameMu.
 	submissionMu.Lock()
-	defer submissionMu.Unlock()
+	subs := make(map[*Client]Submission, len(roundSubmissions))
+	for k, v := range roundSubmissions {
+		subs[k] = v
+	}
+	submissionMu.Unlock()
 
 	gameMu.Lock()
-	
-	if gameState.RoundType == "cifras" {
-		finishCifrasRound()
+	if gameState.RoundType == RoundCifras {
+		finishCifrasRound(subs)
 	} else {
-		finishLetrasRound()
+		finishLetrasRound(subs)
 	}
-	
 	st := gameState
 	gameMu.Unlock()
 
 	broadcast(Message{Type: "state", State: st})
 }
 
-func finishCifrasRound() {
-	if len(roundSubmissions) == 0 {
+// finishCifrasRound processes the cifras round results. Caller must hold gameMu.Lock.
+func finishCifrasRound(subs map[*Client]Submission) {
+	if len(subs) == 0 {
 		gameState.Winner = "Nadie"
 		gameState.Solution = "Nadie envió una respuesta a tiempo."
 		gameState.SolutionSteps = nil
@@ -777,15 +876,15 @@ func finishCifrasRound() {
 		return
 	}
 
-	bestDist := int(^uint(0) >> 1)
-	for _, sub := range roundSubmissions {
+	bestDist := math.MaxInt
+	for _, sub := range subs {
 		if sub.Distance < bestDist {
 			bestDist = sub.Distance
 		}
 	}
 
 	var winners []*Client
-	for c, sub := range roundSubmissions {
+	for c, sub := range subs {
 		if sub.Distance == bestDist {
 			winners = append(winners, c)
 		}
@@ -804,22 +903,22 @@ func finishCifrasRound() {
 
 	if len(winners) > 1 {
 		gameState.Winner = "Empate"
-		gameState.Solution = fmt.Sprintf("Empate a %d (distancia %d) entre: %s - %d pts", roundSubmissions[winners[0]].FinalNumber, bestDist, strings.Join(winnerNames, ", "), pts)
+		gameState.Solution = fmt.Sprintf("Empate a %d (distancia %d) entre: %s - %d pts", subs[winners[0]].FinalNumber, bestDist, strings.Join(winnerNames, ", "), pts)
 	} else {
 		gameState.Winner = winners[0].name
-		gameState.Solution = fmt.Sprintf("Logró %d (a %d del objetivo) - %d puntos", roundSubmissions[winners[0]].FinalNumber, bestDist, pts)
+		gameState.Solution = fmt.Sprintf("Logró %d (a %d del objetivo) - %d puntos", subs[winners[0]].FinalNumber, bestDist, pts)
 	}
 
 	if bestDist == 0 {
 		var firstExact *Client
 		var firstTime time.Time
-		for c, sub := range roundSubmissions {
+		for c, sub := range subs {
 			if sub.Distance == 0 && (firstExact == nil || sub.SubmitTime.Before(firstTime)) {
 				firstExact = c
 				firstTime = sub.SubmitTime
 			}
 		}
-		gameState.SolutionSteps = splitSteps(roundSubmissions[firstExact].Expression)
+		gameState.SolutionSteps = splitSteps(subs[firstExact].Expression)
 		gameState.ExactSolutionSteps = nil
 	} else {
 		exactSteps := findExactSolution(gameState.Numbers, gameState.Target)
@@ -827,13 +926,13 @@ func finishCifrasRound() {
 			gameState.SolutionSteps = nil
 			gameState.ExactSolutionSteps = exactSteps
 		} else {
-			gameState.SolutionSteps = splitSteps(roundSubmissions[winners[0]].Expression)
+			gameState.SolutionSteps = splitSteps(subs[winners[0]].Expression)
 			gameState.ExactSolutionSteps = nil
 		}
 	}
 
 	var others []PlayerResult
-	for _, sub := range roundSubmissions {
+	for _, sub := range subs {
 		others = append(others, PlayerResult{
 			Name:        sub.Client.name,
 			FinalNumber: sub.FinalNumber,
@@ -843,10 +942,11 @@ func finishCifrasRound() {
 	gameState.OtherResults = others
 }
 
-func finishLetrasRound() {
+// finishLetrasRound processes the letras round results. Caller must hold gameMu.Lock.
+func finishLetrasRound(subs map[*Client]Submission) {
 	gameState.ExactSolutionSteps = findBestWords(gameState.Letters)
 
-	if len(roundSubmissions) == 0 {
+	if len(subs) == 0 {
 		gameState.Winner = "Nadie"
 		gameState.Solution = "Nadie envió una palabra a tiempo."
 		gameState.OtherResults = nil
@@ -854,9 +954,9 @@ func finishLetrasRound() {
 	}
 
 	maxLength := 0
-	for _, sub := range roundSubmissions {
-		if utf8.RuneCountInString(sub.Word) > maxLength {
-			maxLength = utf8.RuneCountInString(sub.Word)
+	for _, sub := range subs {
+		if wordLen := utf8.RuneCountInString(sub.Word); wordLen > maxLength {
+			maxLength = wordLen
 		}
 	}
 
@@ -864,21 +964,22 @@ func finishLetrasRound() {
 	var winnerDetails []string
 	var singleWinnerWord string
 	var others []PlayerResult
-	
-	for c, sub := range roundSubmissions {
+
+	for c, sub := range subs {
+		wordLen := utf8.RuneCountInString(sub.Word)
 		others = append(others, PlayerResult{
 			Name:   c.name,
 			Word:   strings.ToUpper(sub.Word),
-			Points: utf8.RuneCountInString(sub.Word),
+			Points: wordLen,
 		})
-		if utf8.RuneCountInString(sub.Word) == maxLength {
+		if wordLen == maxLength {
 			winners = append(winners, c.name)
 			winnerDetails = append(winnerDetails, fmt.Sprintf("%s (%s)", c.name, strings.ToUpper(sub.Word)))
 			singleWinnerWord = strings.ToUpper(sub.Word)
 			gameState.Rankings[c.name] += maxLength
 		}
 	}
-	
+
 	if len(winners) > 1 {
 		gameState.Winner = "Empate"
 		gameState.Solution = fmt.Sprintf("Empate a %d letras entre: %s", maxLength, strings.Join(winnerDetails, ", "))
@@ -886,39 +987,39 @@ func finishLetrasRound() {
 		gameState.Winner = winners[0]
 		gameState.Solution = fmt.Sprintf("Mejor palabra: %s (%d puntos)", singleWinnerWord, maxLength)
 	}
-	
-	gameState.OtherResults = others
 
+	gameState.OtherResults = others
 }
 
 func findBestWords(letters []string) []string {
-	var available [27]int
-	for _, l := range letters {
-		for _, r := range normalizeWord(l) {
-			if idx := runeIndex(r); idx >= 0 {
-				available[idx]++
-			}
-		}
-	}
+	available := letterFrequency(letters)
 
 	var result []string
 	minLength := -1
 
-	for _, entry := range sortedDict {
-		if len(result) >= 5 && entry.runes < minLength {
+	// Iterate from longest to shortest using the index
+	for length := 10; length >= 5; length-- {
+		if len(result) >= 5 && length < minLength {
 			break
 		}
 
-		valid := true
-		for i := 0; i < 27; i++ {
-			if entry.freq[i] > available[i] {
-				valid = false
+		for _, idx := range dictByLength[length] {
+			entry := sortedDict[idx]
+			if len(result) >= 5 && entry.length < minLength {
 				break
 			}
-		}
-		if valid {
-			result = append(result, entry.original)
-			minLength = entry.runes
+
+			valid := true
+			for i := 0; i < AlphabetSize; i++ {
+				if entry.freq[i] > available[i] {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				result = append(result, entry.original)
+				minLength = entry.length
+			}
 		}
 	}
 
@@ -972,8 +1073,14 @@ func findExactSolution(numbers []int, target int) []string {
 		exprs[i] = solveExpr{Value: n}
 	}
 
+	steps := 0
 	var solve func([]solveExpr) []string
 	solve = func(current []solveExpr) []string {
+		steps++
+		if steps > SolverMaxSteps {
+			return nil
+		}
+
 		for _, e := range current {
 			if e.Value == target {
 				return e.Steps
@@ -986,13 +1093,21 @@ func findExactSolution(numbers []int, target int) []string {
 		for i := 0; i < len(current); i++ {
 			for j := i + 1; j < len(current); j++ {
 				e1, e2 := current[i], current[j]
-				ops := []string{"+", "-", "*", "/"}
-				for _, op := range ops {
+				for _, op := range []string{"+", "-", "*", "/"} {
 					a, b := e1.Value, e2.Value
+
+					// Normalize: ensure a >= b for subtraction/division
 					if op == "-" || op == "/" {
 						if a < b {
 							a, b = b, a
 						}
+					}
+					// Skip identity operations that don't produce new values
+					if (op == "+" || op == "-") && b == 0 {
+						continue
+					}
+					if (op == "*" || op == "/") && b == 1 {
+						continue
 					}
 					if op == "-" && a == b {
 						continue
@@ -1000,25 +1115,42 @@ func findExactSolution(numbers []int, target int) []string {
 					if op == "/" && (b == 0 || a%b != 0) {
 						continue
 					}
-					if op == "+" || op == "*" {
-						if a < b {
-							a, b = b, a
-						}
+					// Skip redundant commutative ops when a == b
+					if (op == "+" || op == "*") && a == b {
+						continue
+					}
+					// Normalize commutative ops to canonical form (a >= b)
+					if (op == "+" || op == "*") && a < b {
+						a, b = b, a
 					}
 
-					val := 0
+					var val int
 					switch op {
-					case "+": val = a + b
-					case "-": val = a - b
-					case "*": val = a * b
-					case "/": val = a / b
+					case "+":
+						val = a + b
+					case "-":
+						val = a - b
+					case "*":
+						val = a * b
+					case "/":
+						val = a / b
 					}
 
 					if val <= 0 {
 						continue
 					}
 
-					stepStr := fmt.Sprintf("%d %s %d = %d", a, op, b, val)
+					// Early exit if we found the target
+					if val == target {
+						stepStr := strconv.Itoa(a) + " " + op + " " + strconv.Itoa(b) + " = " + strconv.Itoa(val)
+						result := make([]string, 0, len(e1.Steps)+len(e2.Steps)+1)
+						result = append(result, e1.Steps...)
+						result = append(result, e2.Steps...)
+						result = append(result, stepStr)
+						return result
+					}
+
+					stepStr := strconv.Itoa(a) + " " + op + " " + strconv.Itoa(b) + " = " + strconv.Itoa(val)
 					newSteps := make([]string, 0, len(e1.Steps)+len(e2.Steps)+1)
 					newSteps = append(newSteps, e1.Steps...)
 					newSteps = append(newSteps, e2.Steps...)
@@ -1054,11 +1186,11 @@ func handleSubmission(client *Client, msg Message) {
 	rtype := gameState.RoundType
 	gameMu.RUnlock()
 
-	if status != "playing" {
+	if status != StatusPlaying {
 		return
 	}
 
-	if rtype == "cifras" {
+	if rtype == RoundCifras {
 		handleCifrasSubmission(client, msg.Expression, msg.FinalNumber)
 	} else {
 		handleLetrasSubmission(client, msg.Word)
@@ -1067,6 +1199,11 @@ func handleSubmission(client *Client, msg Message) {
 
 func handleCifrasSubmission(client *Client, expression string, finalNumber int) {
 	if expression == "" || len(expression) > 500 {
+		return
+	}
+
+	steps := strings.Split(expression, ";")
+	if len(steps) > MaxSubmissionSteps {
 		return
 	}
 
@@ -1081,7 +1218,6 @@ func handleCifrasSubmission(client *Client, expression string, finalNumber int) 
 		available[n]++
 	}
 
-	steps := strings.Split(expression, ";")
 	for _, step := range steps {
 		step = strings.TrimSpace(step)
 		if step == "" {
@@ -1131,16 +1267,12 @@ func handleCifrasSubmission(client *Client, expression string, finalNumber int) 
 	submissionMu.Unlock()
 
 	if isBetter {
-		sendJSON(client, Message{
-			Type: "accepted",
+		client.send(Message{
+			Type:        "accepted",
 			FinalNumber: finalNumber,
-			Info: fmt.Sprintf("✔ Mejor respuesta: %d (distancia: %d)", finalNumber, dist),
+			Info:        fmt.Sprintf("✔ Mejor respuesta: %d (distancia: %d)", finalNumber, dist),
 		})
 	}
-
-	clientsMu.RLock()
-	totalPlayers := len(clients)
-	clientsMu.RUnlock()
 
 	submissionMu.Lock()
 	exactCount := 0
@@ -1151,12 +1283,16 @@ func handleCifrasSubmission(client *Client, expression string, finalNumber int) 
 	}
 	submissionMu.Unlock()
 
+	clientsMu.RLock()
+	totalPlayers := len(clients)
+	clientsMu.RUnlock()
+
 	if exactCount > 0 && exactCount == totalPlayers {
-		gameMu.Lock()
+		timerMu.Lock()
 		if roundTimer != nil {
 			roundTimer.Stop()
 		}
-		gameMu.Unlock()
+		timerMu.Unlock()
 		finishRound()
 	}
 }
@@ -1173,14 +1309,7 @@ func handleLetrasSubmission(client *Client, word string) {
 	copy(lettersCopy, gameState.Letters)
 	gameMu.RUnlock()
 
-	var available [27]int
-	for _, l := range lettersCopy {
-		for _, r := range normalizeWord(l) {
-			if idx := runeIndex(r); idx >= 0 {
-				available[idx]++
-			}
-		}
-	}
+	available := letterFrequency(lettersCopy)
 
 	validLetters := true
 	for _, r := range word {
@@ -1194,13 +1323,13 @@ func handleLetrasSubmission(client *Client, word string) {
 	}
 
 	if !validLetters {
-		sendJSON(client, Message{Type: "error", Error: "La palabra usa letras no disponibles."})
+		client.send(Message{Type: "error", Error: "La palabra usa letras no disponibles."})
 		return
 	}
 
 	originalWord, ok := dictionary[word]
 	if !ok {
-		sendJSON(client, Message{Type: "error", Error: "La palabra no está en el diccionario."})
+		client.send(Message{Type: "error", Error: "La palabra no está en el diccionario."})
 		return
 	}
 
@@ -1218,7 +1347,7 @@ func handleLetrasSubmission(client *Client, word string) {
 	submissionMu.Unlock()
 
 	if isBetter {
-		sendJSON(client, Message{
+		client.send(Message{
 			Type: "accepted",
 			Word: strings.ToUpper(originalWord),
 			Info: fmt.Sprintf("✔ Palabra enviada: %s (%d puntos)", strings.ToUpper(originalWord), utf8.RuneCountInString(originalWord)),
@@ -1227,7 +1356,7 @@ func handleLetrasSubmission(client *Client, word string) {
 }
 
 func consumeNumber(available map[int]int, n int) bool {
-	if available[n] <= 0 {
+	if n < 0 || available[n] <= 0 {
 		return false
 	}
 	available[n]--
@@ -1255,13 +1384,6 @@ func computeOperation(a, b int, op string) (int, bool) {
 // ─────────────────────────────────────────────
 // Networking Helpers
 // ─────────────────────────────────────────────
-
-func sendJSON(client *Client, msg Message) {
-	select {
-	case client.sendCh <- msg:
-	default:
-	}
-}
 
 func broadcast(msg Message) {
 	clientsMu.RLock()
