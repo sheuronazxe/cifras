@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 	"sync"
 	"syscall"
 	"time"
@@ -754,8 +755,8 @@ func finishLetrasRound() {
 
 	maxLength := 0
 	for _, sub := range roundSubmissions {
-		if len(sub.Word) > maxLength {
-			maxLength = len(sub.Word)
+		if utf8.RuneCountInString(sub.Word) > maxLength {
+			maxLength = utf8.RuneCountInString(sub.Word)
 		}
 	}
 
@@ -768,9 +769,9 @@ func finishLetrasRound() {
 		others = append(others, PlayerResult{
 			Name:   c.name,
 			Word:   strings.ToUpper(sub.Word),
-			Points: len(sub.Word),
+			Points: utf8.RuneCountInString(sub.Word),
 		})
-		if len(sub.Word) == maxLength {
+		if utf8.RuneCountInString(sub.Word) == maxLength {
 			winners = append(winners, c.name)
 			winnerDetails = append(winnerDetails, fmt.Sprintf("%s (%s)", c.name, strings.ToUpper(sub.Word)))
 			singleWinnerWord = strings.ToUpper(sub.Word)
@@ -824,7 +825,7 @@ func findBestWords(letters []string) []string {
 	if len(result) > 5 {
 		var top, tied []string
 		for _, w := range result {
-			if len([]rune(w)) > minLength {
+			if utf8.RuneCountInString(w) > minLength {
 				top = append(top, w)
 			} else {
 				tied = append(tied, w)
@@ -1063,7 +1064,7 @@ func handleCifrasSubmission(client *Client, expression string, finalNumber int) 
 func handleLetrasSubmission(client *Client, word string) {
 	word = strings.TrimSpace(word)
 	word = normalizeWord(word)
-	if len(word) < 5 || len(word) > 10 {
+	if utf8.RuneCountInString(word) < 5 || utf8.RuneCountInString(word) > 10 {
 		return
 	}
 
@@ -1102,7 +1103,7 @@ func handleLetrasSubmission(client *Client, word string) {
 	now := time.Now()
 	submissionMu.Lock()
 	existing, exists := roundSubmissions[client]
-	isBetter := !exists || len(word) > len(existing.Word)
+	isBetter := !exists || utf8.RuneCountInString(word) > utf8.RuneCountInString(existing.Word)
 	if isBetter {
 		roundSubmissions[client] = Submission{
 			Client:     client,
@@ -1116,7 +1117,7 @@ func handleLetrasSubmission(client *Client, word string) {
 		sendJSON(client, Message{
 			Type: "accepted",
 			Word: strings.ToUpper(word),
-			Info: fmt.Sprintf("✔ Palabra enviada: %s (%d puntos)", strings.ToUpper(word), len(word)),
+			Info: fmt.Sprintf("✔ Palabra enviada: %s (%d puntos)", strings.ToUpper(word), utf8.RuneCountInString(word)),
 		})
 	}
 }
