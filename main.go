@@ -30,6 +30,8 @@ const (
 	NumbersRoundDuration = 50 * time.Second
 	LettersRoundDuration = 50 * time.Second
 	GracePeriod          = 2 * time.Second
+	ChooserTimeout       = 10 * time.Second
+	ReadyTimeout         = 30 * time.Second
 	MaxPlayerName        = 20
 	MaxClients           = 20
 	MinPlayersToStart    = 1
@@ -131,6 +133,8 @@ var (
 	gameMu sync.RWMutex
 
 	roundTimer       *time.Timer
+	chooserTimer     *time.Timer
+	readyTimer       *time.Timer
 	roundSubmissions = make(map[*Client]Submission)
 	submissionMu     sync.Mutex
 
@@ -236,8 +240,8 @@ func main() {
 	srv := &http.Server{Addr: addr, Handler: mux}
 
 	go func() {
-		fmt.Printf("🎮 Servidor Cifras Multijugador iniciado en http://localhost%s\n", addr)
-		fmt.Println("📡 Esperando conexiones...")
+		log.Printf("Servidor Cifras Multijugador iniciado en http://localhost%s\n", addr)
+		log.Println("📡 Esperando conexiones...")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Error iniciando servidor: %v", err)
 		}
@@ -247,7 +251,7 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
-	fmt.Println("\n🛑 Apagando servidor...")
+	log.Println("🛑 Apagando servidor...")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
@@ -288,6 +292,8 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	}
 	clients[client] = true
 	clientsMu.Unlock()
+
+	log.Printf("🔌 Cliente conectado desde %s (total: %d)", r.RemoteAddr, len(clients))
 
 	gameMu.RLock()
 	st := gameState
@@ -359,6 +365,8 @@ func cleanupClient(client *Client) {
 	clientsMu.Lock()
 	delete(clients, client)
 	clientsMu.Unlock()
+
+	log.Printf("🔌 Cliente '%s' desconectado (total: %d)", client.name, len(clients))
 
 	submissionMu.Lock()
 	delete(roundSubmissions, client)
@@ -448,6 +456,7 @@ func handleJoin(client *Client, msg Message) {
 	client.name = name
 	clientsMu.Unlock()
 
+	log.Printf("👤 Jugador '%s' se unió (estado: %s)", name, gameState.Status)
 	broadcastPlayers()
 }
 
@@ -485,26 +494,46 @@ func handleReady(client *Client) {
 	client.ready = true
 	clientsMu.Unlock()
 
+	log.Printf("✅ Jugador '%s' está listo (estado: %s)", client.name, gameState.Status)
 	broadcastPlayers()
 	checkAllReady()
 }
 
 func checkAllReady() {
 	clientsMu.RLock()
-	defer clientsMu.RUnlock()
-
 	count := len(clients)
+	allReady := true
+	for c := range clients {
+		if !c.ready {
+			allReady = false
+			break
+		}
+	}
+	clientsMu.RUnlock()
+
 	if count < MinPlayersToStart {
 		return
 	}
 
-	for c := range clients {
-		if !c.ready {
-			return
+	if allReady {
+		if readyTimer != nil {
+			readyTimer.Stop()
+			readyTimer = nil
 		}
+		go startNewRound()
+		return
 	}
 
-	go startNewRound()
+	if readyTimer == nil {
+		readyTimer = time.AfterFunc(ReadyTimeout, func() {
+			clientsMu.RLock()
+			currentCount := len(clients)
+			clientsMu.RUnlock()
+			if currentCount >= MinPlayersToStart {
+				go startNewRound()
+			}
+		})
+	}
 }
 
 // ─────────────────────────────────────────────
@@ -512,6 +541,11 @@ func checkAllReady() {
 // ─────────────────────────────────────────────
 
 func startNewRound() {
+	if readyTimer != nil {
+		readyTimer.Stop()
+		readyTimer = nil
+	}
+
 	gameMu.Lock()
 	if gameState.Status != "waiting" && gameState.Status != "finished" {
 		gameMu.Unlock()
@@ -554,20 +588,34 @@ func startNewRound() {
 		now := time.Now()
 		gameState.EndTime = now.Add(NumbersRoundDuration).Unix()
 		gameState.ServerNow = now.Unix()
-		
+
 		roundTimer = time.AfterFunc(NumbersRoundDuration, timeOutRound)
+
+		log.Printf("🎮 Ronda #%d CIFRAS iniciada - Objetivo: %d - Números: %v", gameState.TotalRounds, gameState.Target, gameState.Numbers)
 	} else {
 		gameState.RoundType = "letras"
 		gameState.Status = "choosing"
 		gameState.Numbers = nil
 		gameState.Target = 0
-		
+
 		sort.Slice(players, func(i, j int) bool { return players[i].name < players[j].name })
 		chooser := players[turnIndex%len(players)]
 		turnIndex++
 		gameState.Chooser = chooser.name
 		gameState.EndTime = 0
 		gameState.ServerNow = time.Now().Unix()
+
+		if chooserTimer != nil {
+			chooserTimer.Stop()
+		}
+		chooserTimer = time.AfterFunc(ChooserTimeout, timeoutChooser)
+
+		log.Printf("🎮 Ronda #%d LETRAS iniciada - Chooser: %s (%d jugadores)", gameState.TotalRounds, chooser.name, len(players))
+
+		if chooserTimer != nil {
+			chooserTimer.Stop()
+		}
+		chooserTimer = time.AfterFunc(ChooserTimeout, timeoutChooser)
 	}
 
 	st := gameState
@@ -601,10 +649,16 @@ func handleVowels(client *Client, count int) {
 	gameState.EndTime = now.Add(LettersRoundDuration).Unix()
 	gameState.ServerNow = now.Unix()
 
+	if chooserTimer != nil {
+		chooserTimer.Stop()
+		chooserTimer = nil
+	}
 	roundTimer = time.AfterFunc(LettersRoundDuration, timeOutRound)
 	st := gameState
 
 	broadcast(Message{Type: "state", State: st})
+
+	log.Printf("🎮 Ronda #%d LETRAS iniciada - Letras: %v", gameState.TotalRounds, letters)
 }
 
 func shuffleSlice[T any](s []T) {
@@ -648,6 +702,36 @@ func timeOutRound() {
 	time.AfterFunc(GracePeriod, func() {
 		finishRound()
 	})
+}
+
+func timeoutChooser() {
+	gameMu.Lock()
+	defer gameMu.Unlock()
+
+	if gameState.Status != "choosing" || gameState.RoundType != "letras" {
+		return
+	}
+
+	vowelCount := rand.IntN(3) + 3
+	vowels := getVowels(vowelCount)
+	consonants := getConsonants(10 - vowelCount)
+
+	letters := append(vowels, consonants...)
+	shuffleSlice(letters)
+
+	gameState.Letters = letters
+	gameState.Status = "playing"
+	now := time.Now()
+	gameState.EndTime = now.Add(LettersRoundDuration).Unix()
+	gameState.ServerNow = now.Unix()
+
+	if roundTimer != nil {
+		roundTimer.Stop()
+	}
+	roundTimer = time.AfterFunc(LettersRoundDuration, timeOutRound)
+
+	st := gameState
+	broadcast(Message{Type: "state", State: st})
 }
 
 func finishRound() {
