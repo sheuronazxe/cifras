@@ -86,9 +86,10 @@ type Submission struct {
 }
 
 type DictEntry struct {
-	word  string
-	freq  [26]int
-	runes int
+	original string
+	word     string
+	freq     [27]int
+	runes    int
 }
 
 type PlayerInfo struct {
@@ -135,13 +136,13 @@ var (
 
 	stepRegex = regexp.MustCompile(`^(\d+)\s*([+\-*/])\s*(\d+)\s*=\s*(\d+)$`)
 
-	dictionary map[string]struct{}
+	dictionary map[string]string // normalized -> original
 	sortedDict []DictEntry
 	turnIndex  = 0
 )
 
 func init() {
-	dictionary = make(map[string]struct{})
+	dictionary = make(map[string]string)
 	f, err := os.Open("assets/diccionario.txt")
 	if err != nil {
 		log.Println("Advertencia: No se pudo cargar diccionario.txt:", err)
@@ -157,8 +158,11 @@ func init() {
 		if w == "" {
 			continue
 		}
+		original := w
 		norm := normalizeWord(w)
-		dictionary[norm] = struct{}{}
+		if _, exists := dictionary[norm]; !exists {
+			dictionary[norm] = original
+		}
 		if _, ok := seen[norm]; !ok {
 			seen[norm] = struct{}{}
 			rawWords = append(rawWords, norm)
@@ -175,17 +179,19 @@ func buildSortedDict(rawWords []string) {
 		if len(runes) < 5 {
 			continue
 		}
-		var freq [26]int
+		var freq [27]int
 		valid := true
 		for _, r := range runes {
-			if r < 'a' || r > 'z' {
+			idx := runeIndex(r)
+			if idx < 0 {
 				valid = false
 				break
 			}
-			freq[r-'a']++
+			freq[idx]++
 		}
 		if valid {
-			sortedDict = append(sortedDict, DictEntry{word, freq, len(runes)})
+			original := dictionary[word]
+			sortedDict = append(sortedDict, DictEntry{original, word, freq, len(runes)})
 		}
 	}
 	sort.Slice(sortedDict, func(i, j int) bool {
@@ -199,6 +205,16 @@ var normalizeReplacer = strings.NewReplacer(
 
 func normalizeWord(w string) string {
 	return normalizeReplacer.Replace(strings.ToLower(w))
+}
+
+func runeIndex(r rune) int {
+	if r >= 'a' && r <= 'z' {
+		return int(r - 'a')
+	}
+	if r == 'ñ' {
+		return 26
+	}
+	return -1
 }
 
 // ─────────────────────────────────────────────
@@ -792,11 +808,11 @@ func finishLetrasRound() {
 }
 
 func findBestWords(letters []string) []string {
-	var available [26]int
+	var available [27]int
 	for _, l := range letters {
 		for _, r := range normalizeWord(l) {
-			if r >= 'a' && r <= 'z' {
-				available[r-'a']++
+			if idx := runeIndex(r); idx >= 0 {
+				available[idx]++
 			}
 		}
 	}
@@ -810,14 +826,14 @@ func findBestWords(letters []string) []string {
 		}
 
 		valid := true
-		for i := 0; i < 26; i++ {
+		for i := 0; i < 27; i++ {
 			if entry.freq[i] > available[i] {
 				valid = false
 				break
 			}
 		}
 		if valid {
-			result = append(result, entry.word)
+			result = append(result, entry.original)
 			minLength = entry.runes
 		}
 	}
@@ -1073,17 +1089,20 @@ func handleLetrasSubmission(client *Client, word string) {
 	copy(lettersCopy, gameState.Letters)
 	gameMu.RUnlock()
 
-	available := make(map[rune]int)
+	var available [27]int
 	for _, l := range lettersCopy {
 		for _, r := range normalizeWord(l) {
-			available[r]++
+			if idx := runeIndex(r); idx >= 0 {
+				available[idx]++
+			}
 		}
 	}
 
 	validLetters := true
 	for _, r := range word {
-		if available[r] > 0 {
-			available[r]--
+		idx := runeIndex(r)
+		if idx >= 0 && available[idx] > 0 {
+			available[idx]--
 		} else {
 			validLetters = false
 			break
@@ -1095,7 +1114,8 @@ func handleLetrasSubmission(client *Client, word string) {
 		return
 	}
 
-	if _, ok := dictionary[word]; !ok {
+	originalWord, ok := dictionary[word]
+	if !ok {
 		sendJSON(client, Message{Type: "error", Error: "La palabra no está en el diccionario."})
 		return
 	}
@@ -1103,11 +1123,11 @@ func handleLetrasSubmission(client *Client, word string) {
 	now := time.Now()
 	submissionMu.Lock()
 	existing, exists := roundSubmissions[client]
-	isBetter := !exists || utf8.RuneCountInString(word) > utf8.RuneCountInString(existing.Word)
+	isBetter := !exists || utf8.RuneCountInString(originalWord) > utf8.RuneCountInString(existing.Word)
 	if isBetter {
 		roundSubmissions[client] = Submission{
 			Client:     client,
-			Word:       word,
+			Word:       originalWord,
 			SubmitTime: now,
 		}
 	}
@@ -1116,8 +1136,8 @@ func handleLetrasSubmission(client *Client, word string) {
 	if isBetter {
 		sendJSON(client, Message{
 			Type: "accepted",
-			Word: strings.ToUpper(word),
-			Info: fmt.Sprintf("✔ Palabra enviada: %s (%d puntos)", strings.ToUpper(word), utf8.RuneCountInString(word)),
+			Word: strings.ToUpper(originalWord),
+			Info: fmt.Sprintf("✔ Palabra enviada: %s (%d puntos)", strings.ToUpper(originalWord), utf8.RuneCountInString(originalWord)),
 		})
 	}
 }
