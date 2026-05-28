@@ -1,0 +1,17 @@
+.git
+.gitignore
+.idea
+.vscode
+*.md
+guidelines
+frontend/node_modules
+frontend/.svelte-kit
+frontend/build
+frontend/.vite
+frontend/bun.lock
+backend/cifras
+*.test
+*.exe
+.env
+.env.*
+clean.sh
