@@ -112,13 +112,21 @@
 	}
 
 	let executing = $state(false);
+	let executeTimeout: ReturnType<typeof setTimeout> | null = null;
+
+	$effect(() => {
+		return () => {
+			if (executeTimeout) clearTimeout(executeTimeout);
+		};
+	});
 
 	function checkAndExecute() {
 		if (firstNumber && secondNumber && selectedOp && !executing) {
 			executing = true;
-			setTimeout(() => {
+			executeTimeout = setTimeout(() => {
 				executeOp();
 				executing = false;
+				executeTimeout = null;
 			}, 200);
 		}
 	}

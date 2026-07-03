@@ -6,6 +6,13 @@ interface Toast {
     type: string;
 }
 
+type ServerMessageType = 'SYNC' | 'WELCOME' | 'WORD_ACCEPTED' | 'TOAST';
+
+interface ServerMessage {
+    type: ServerMessageType;
+    payload: any;
+}
+
 interface Player {
     id: string;
     name: string;
@@ -133,7 +140,7 @@ export class GameStore {
         };
 
         ws.onmessage = (event) => {
-            let data: any;
+            let data: ServerMessage;
             try {
                 data = JSON.parse(event.data);
             } catch (e) {
@@ -178,7 +185,7 @@ export class GameStore {
 
             this.state = 'RECONNECTING';
             if (this.reconnectAttempts < this.maxReconnectAttempts) {
-                const backoff = Math.pow(2, this.reconnectAttempts) * 1000;
+                const backoff = Math.pow(2, this.reconnectAttempts) * 1000 + Math.random() * 500;
                 setTimeout(() => this.establishWs(), backoff);
                 this.reconnectAttempts++;
             } else {

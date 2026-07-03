@@ -18,7 +18,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'sha256-hQqennwHsYyvEbTGfQDB8lwrBvT4KMNmxLIo+uwVWaw='; img-src 'self' data:; upgrade-insecure-requests")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; upgrade-insecure-requests")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -82,7 +82,11 @@ func main() {
 		port = "8080"
 	}
 
-	srv := &http.Server{Addr: ":" + port, Handler: securityHeaders(mux)}
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           securityHeaders(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	go func() {
 		log.Printf("Servidor escuchando en http://localhost:%s", port)

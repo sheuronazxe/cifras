@@ -19,8 +19,8 @@
 			<button class="custom-button vowel-btn" onclick={() => chooseVowels(6)}>6</button>
 		</div>
 	{:else}
-		<h2>Elige {game.gameState.chooser}</h2>
-		<p>Esperando a que elijan las letras...</p>
+		<h2>Le toca a {game.gameState.chooser}</h2>
+		<p>Esperando a que elija las letras...</p>
 		<div class="loader"></div>
 	{/if}
 </div>

@@ -14,6 +14,7 @@ frontend/node_modules/
 frontend/build/
 frontend/.svelte-kit/
 frontend/.vite/
+frontend/package-lock.json
 
 # Lockfiles
 frontend/yarn.lock

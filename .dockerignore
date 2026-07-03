@@ -11,6 +11,7 @@ frontend/.vite
 frontend/bun.lock
 backend/cifras
 *.test
+*_test.go
 *.exe
 .env
 .env.*

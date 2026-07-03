@@ -12,6 +12,6 @@ type GameAction struct {
 	Message  types.ClientMessage
 	Conn     *websocket.Conn
 	Client   *Client
-	RoundGen int64 // prevents stale TIMEOUT events
+	TimerGen int64 // prevents stale TIMEOUT events
 	Extra    any   // used internally for test setup and timer coordination
 }

@@ -37,7 +37,7 @@ type GameRoom struct {
 
 	timer      *time.Timer
 	chooserIdx int
-	roundGen   int64
+	timerGen   int64
 	done       chan struct{}
 	runDone    chan struct{} // closed when Run() exits
 	closed     atomic.Bool
@@ -152,8 +152,10 @@ func (r *GameRoom) handleJoin(action GameAction) {
 	newClient := action.Client
 
 	if oldClient != nil {
-		// Reconnect: copy player state
+		// Reconnect: copy player state and clean up old connection
 		newClient.Player = oldClient.Player
+		oldClient.closeConn()
+		close(oldClient.SendChan)
 	} else if histPlayer, ok := r.HistoricalPlayers[action.PlayerID]; ok {
 		// Reconnect: copy historical player state
 		newClient.Player = histPlayer
@@ -168,8 +170,6 @@ func (r *GameRoom) handleJoin(action GameAction) {
 	}
 
 	r.Clients[action.PlayerID] = newClient
-
-	r.broadcastState()
 }
 
 func (r *GameRoom) uniqueName(name string) string {
@@ -199,9 +199,10 @@ func (r *GameRoom) handleLeave(action GameAction) {
 		delete(r.Clients, action.PlayerID)
 		close(client.SendChan)
 
-		// If playing and it's chooser, auto pick
+		// If choosing and it's chooser, auto pick (startLettersRound broadcasts)
 		if r.State.State == types.StateChoosing && r.State.ChooserID == client.Player.ID {
 			r.startLettersRound(rand.IntN(4) + 3) // 3 to 6 vowels
+			return
 		}
 
 		if len(r.Clients) == 0 {
@@ -296,29 +297,30 @@ func (r *GameRoom) setTimer(d time.Duration) {
 	if r.timer != nil {
 		r.timer.Stop()
 	}
-	gen := r.roundGen
+	r.timerGen++
+	gen := r.timerGen
 	r.timer = time.AfterFunc(d, func() {
 		defer func() { recover() }()
 		select {
 		case <-r.done:
 			return
-		case r.ActionChan <- GameAction{Type: "TIMEOUT", RoundGen: gen}:
+		case r.ActionChan <- GameAction{Type: "TIMEOUT", TimerGen: gen}:
 		}
 	})
 	r.State.EndTime = time.Now().Add(d).UnixMilli()
 }
 
 func (r *GameRoom) handleTimeout(action GameAction) {
+	if action.TimerGen != r.timerGen {
+		return
+	}
+
 	// Para el estado de juego, somos más permisivos para evitar bloqueos
 	if r.State.State == types.StatePlaying {
 		r.finishRound()
 		return
 	}
 
-	if action.RoundGen != r.roundGen {
-		return
-	}
-	
 	switch r.State.State {
 	case types.StateLobby, types.StateFinished:
 		r.startNewRound()
@@ -328,16 +330,31 @@ func (r *GameRoom) handleTimeout(action GameAction) {
 }
 
 func (r *GameRoom) startNewRound() {
-	r.State.CurrentRound++
 	r.BestAnswers = make(map[string]types.PlayerResult)
-	r.roundGen++
 	r.State.Chooser = ""
 	r.State.ChooserID = ""
+	// Limpiar campos de la ronda anterior para evitar estado stale
+	r.State.Winner = ""
+	r.State.Solution = ""
+	r.State.SolutionSteps = nil
+	r.State.ExactSolutionSteps = nil
+	r.State.OtherResults = nil
 
 	// Reset ready state
 	for _, c := range r.Clients {
 		c.Player.IsReady = false
 	}
+
+	// Pick chooser (validación temprana para Cifras y Letras)
+	var ids []string
+	for id := range r.Clients {
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	r.State.CurrentRound++
 
 	if r.State.CurrentRound%2 != 0 {
 		// Cifras
@@ -346,20 +363,11 @@ func (r *GameRoom) startNewRound() {
 		r.State.Numbers = generateNumbers()
 		r.State.TargetNumber = rand.IntN(899) + 101
 		r.setTimer(NumbersRoundDuration)
-		r.broadcastState()
 	} else {
 		// Letras (Choosing phase)
 		r.State.State = types.StateChoosing
 		r.State.RoundType = types.RoundLetras
-		
-		// Pick chooser
-		var ids []string
-		for id := range r.Clients {
-			ids = append(ids, id)
-		}
-		if len(ids) == 0 {
-			return
-		}
+
 		sort.Strings(ids)
 		r.chooserIdx = (r.chooserIdx + 1) % len(ids)
 		chooser := r.Clients[ids[r.chooserIdx]]
@@ -367,8 +375,8 @@ func (r *GameRoom) startNewRound() {
 		r.State.ChooserID = chooser.Player.ID
 
 		r.setTimer(ChooserTimeout)
-		r.broadcastState()
 	}
+	r.broadcastState()
 }
 
 func (r *GameRoom) handleChooseVowels(action GameAction) {
@@ -443,10 +451,12 @@ func (r *GameRoom) handleSubmitCifras(c *Client, msg types.ClientMessage) {
 		result, _ := strconv.Atoi(matches[4])
 		op := matches[2]
 
-		if !consumeNumber(available, a) || !consumeNumber(available, b) {
+		if available[a] <= 0 || available[b] <= 0 {
 			r.sendToast(c.ID, types.ToastMessage{Message: "Número no disponible", Type: "error"})
 			return
 		}
+		available[a]--
+		available[b]--
 
 		expected, ok := computeOperation(a, b, op)
 		if !ok || expected <= 0 || expected != result {
@@ -511,7 +521,7 @@ func (r *GameRoom) handleSubmitLetras(c *Client, msg types.ClientMessage) {
 	}
 
 	prev, hasPrev := r.BestAnswers[c.ID]
-	if !hasPrev || len([]rune(orig)) > len([]rune(prev.Word)) {
+	if !hasPrev || len([]rune(orig)) >= len([]rune(prev.Word)) {
 		r.BestAnswers[c.ID] = types.PlayerResult{
 			PlayerID: c.ID,
 			Name:     c.Player.Name,
@@ -681,6 +691,8 @@ func (r *GameRoom) resetToLobby() {
 	}
 	r.State = types.SyncData{State: types.StateLobby}
 	r.BestAnswers = make(map[string]types.PlayerResult)
+	// Limpiar jugadores históricos cuando la sala queda vacía
+	r.HistoricalPlayers = make(map[string]types.Player)
 }
 
 func generateNumbers() []int {

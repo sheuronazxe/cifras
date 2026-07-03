@@ -52,6 +52,7 @@
 	});
 
 	$effect(() => {
+		// Cleanup: desconectar WebSocket al desmontar el componente
 		return () => {
 			game.disconnect();
 		};

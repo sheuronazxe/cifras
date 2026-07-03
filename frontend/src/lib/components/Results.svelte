@@ -42,6 +42,13 @@
 		}
 
 		list.sort((a, b) => {
+			const scoreA =
+				game.gameState.players.find((p) => p.id === a.playerId)?.score ?? 0;
+			const scoreB =
+				game.gameState.players.find((p) => p.id === b.playerId)?.score ?? 0;
+			if (scoreA !== scoreB) {
+				return scoreB - scoreA;
+			}
 			if (a.points !== b.points) {
 				return b.points - a.points;
 			}
@@ -157,7 +164,7 @@
 						<span class="col-total total-cell">
 							{game.gameState.players.find(
 								(p) => p.id === res.playerId,
-							)?.score || 0}
+							)?.score ?? 0}
 						</span>
 						<span class="col-status status-cell">
 							<span

@@ -54,7 +54,11 @@ func (s *solverState) dfs(ctx context.Context, current []OpResult) bool {
 		diff := int(math.Abs(float64(op.value - s.target)))
 		if diff < s.bestDiff {
 			s.bestDiff = diff
-			s.bestSteps = op.steps
+			if len(op.steps) > 0 {
+				s.bestSteps = op.steps
+			} else {
+				s.bestSteps = []string{fmt.Sprintf("%d", op.value)}
+			}
 		}
 		if s.bestDiff == 0 {
 			return true

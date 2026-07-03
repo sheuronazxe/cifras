@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net"
@@ -19,18 +21,28 @@ import (
 )
 
 const (
-	PingInterval       = 30 * time.Second
-	PingTimeout        = 5 * time.Second
+	PingInterval      = 30 * time.Second
+	PingTimeout       = 5 * time.Second
 
-	RateLimitInterval  = 100 * time.Millisecond
-	RateLimitBurst     = 10
+	RateLimitInterval = 100 * time.Millisecond
+	RateLimitBurst    = 10
 )
 
-var clientIDCounter atomic.Int64
+// allowedClientTypes es la lista de tipos de mensaje que un cliente puede enviar.
+// Cualquier otro tipo (internos como JOIN, LEAVE, TIMEOUT, SETUP) se rechaza.
+var allowedClientTypes = map[string]bool{
+	"NAME":          true,
+	"READY":         true,
+	"CHOOSE_VOWELS": true,
+	"SUBMIT":        true,
+}
 
 func generateClientID() string {
-	id := clientIDCounter.Add(1)
-	return fmt.Sprintf("client-%d", id)
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // ServeWs actualiza la conexión HTTP a WebSocket e inicia el cliente
@@ -64,7 +76,6 @@ func ServeWs(room *GameRoom, w http.ResponseWriter, r *http.Request) {
 		Conn:       conn,
 		SendChan:   make(chan types.ServerMessage, 256),
 		Room:       room,
-		closeOnce:  &sync.Once{},
 		lastMsgAt:  time.Now(),
 	}
 
@@ -87,7 +98,7 @@ type Client struct {
 	Conn       *websocket.Conn
 	SendChan   chan types.ServerMessage
 	Room       *GameRoom
-	closeOnce  *sync.Once
+	closeOnce  sync.Once
 	lastMsgAt  time.Time
 	msgTokens  atomic.Int64
 }
@@ -140,6 +151,11 @@ func (c *Client) readPump() {
 
 		if c.isRateLimited() {
 			log.Printf("Rate limited client %s", c.ID)
+			continue
+		}
+
+		if !allowedClientTypes[msg.Type] {
+			log.Printf("Rejected message type %q from client %s", msg.Type, c.ID)
 			continue
 		}
 

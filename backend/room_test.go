@@ -14,6 +14,34 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
+// sendSync envía una acción al room y espera hasta que haya sido procesada.
+func sendSync(t *testing.T, room *GameRoom, action GameAction) {
+	t.Helper()
+	done := make(chan struct{})
+	room.ActionChan <- action
+	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() { close(done) }}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sendSync timed out")
+	}
+}
+
+// assertSync ejecuta fn dentro del goroutine de Run (acceso seguro al estado).
+func assertSync(t *testing.T, room *GameRoom, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+		defer close(done)
+		fn()
+	}}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("assertSync timed out")
+	}
+}
+
 func TestGameRoomStartNewRound(t *testing.T) {
 	room := NewGameRoom()
 	go room.Run()
@@ -24,25 +52,18 @@ func TestGameRoomStartNewRound(t *testing.T) {
 		SendChan: make(chan types.ServerMessage, 10),
 		Room:     room,
 	}
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: client1.ID, Client: client1}
-	time.Sleep(50 * time.Millisecond)
-
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: client1.ID, Client: client1})
+	assertSync(t, room, func() {
 		if room.State.State != types.StateLobby {
 			t.Fatalf("expected LOBBY, got %s", room.State.State)
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
-
-	room.ActionChan <- GameAction{Type: "READY", PlayerID: client1.ID}
-	time.Sleep(100 * time.Millisecond)
-
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	})
+	sendSync(t, room, GameAction{Type: "READY", PlayerID: client1.ID})
+	assertSync(t, room, func() {
 		if room.State.State != types.StatePlaying && room.State.State != types.StateChoosing {
 			t.Fatalf("expected PLAYING or CHOOSING after ready, got %s", room.State.State)
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 }
 
 func TestGameRoomSubmitCifras(t *testing.T) {
@@ -55,37 +76,25 @@ func TestGameRoomSubmitCifras(t *testing.T) {
 		SendChan: make(chan types.ServerMessage, 10),
 		Room:     room,
 	}
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: client1.ID, Client: client1}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: client1.ID, Client: client1})
+	sendSync(t, room, GameAction{Type: "READY", PlayerID: client1.ID})
 
-	room.ActionChan <- GameAction{Type: "READY", PlayerID: client1.ID}
-	time.Sleep(100 * time.Millisecond)
-
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
-		if room.State.RoundType != types.RoundCifras && room.State.State != types.StatePlaying {
-			room.ActionChan <- GameAction{Type: "READY", PlayerID: client1.ID}
-		}
-	}}
-	time.Sleep(100 * time.Millisecond)
-
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		room.State.State = types.StatePlaying
 		room.State.RoundType = types.RoundCifras
 		room.State.Numbers = []int{2, 3, 10, 5, 1, 1}
 		room.State.TargetNumber = 60
 		room.BestAnswers = make(map[string]types.PlayerResult)
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 
 	expr := "10 * 5 = 50\n50 + 2 = 52"
-	room.ActionChan <- GameAction{
+	sendSync(t, room, GameAction{
 		Type:     "SUBMIT",
 		PlayerID: client1.ID,
 		Message:  types.ClientMessage{Expr: expr, Number: 52},
-	}
-	time.Sleep(50 * time.Millisecond)
+	})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		ans, ok := room.BestAnswers[client1.ID]
 		if !ok {
 			t.Fatalf("expected answer for client-1")
@@ -93,8 +102,7 @@ func TestGameRoomSubmitCifras(t *testing.T) {
 		if ans.Distance != 8 {
 			t.Fatalf("expected distance 8, got %d", ans.Distance)
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 }
 
 func TestGameRoomFinishCifrasScoring(t *testing.T) {
@@ -105,11 +113,10 @@ func TestGameRoomFinishCifrasScoring(t *testing.T) {
 	c1 := &Client{ID: "c1", SendChan: make(chan types.ServerMessage, 10), Room: room}
 	c2 := &Client{ID: "c2", SendChan: make(chan types.ServerMessage, 10), Room: room}
 
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1}
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c2.ID, Client: c2}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1})
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c2.ID, Client: c2})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		room.State.State = types.StatePlaying
 		room.State.RoundType = types.RoundCifras
 		room.State.TargetNumber = 100
@@ -118,13 +125,11 @@ func TestGameRoomFinishCifrasScoring(t *testing.T) {
 			c1.ID: {PlayerID: c1.ID, Name: "A", FinalNumber: 100, Distance: 0, Expression: "10 * 10 = 100"},
 			c2.ID: {PlayerID: c2.ID, Name: "B", FinalNumber: 95, Distance: 5, Expression: "10 * 10 = 100\n100 - 5 = 95"},
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 
-	room.ActionChan <- GameAction{Type: "TIMEOUT"}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "TIMEOUT"})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		if c1.Player.Score != 10 {
 			t.Fatalf("expected c1 score 10, got %d", c1.Player.Score)
 		}
@@ -134,8 +139,7 @@ func TestGameRoomFinishCifrasScoring(t *testing.T) {
 		if room.State.Winner != "A" {
 			t.Fatalf("expected winner A, got %s", room.State.Winner)
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 }
 
 func TestGameRoomFinishCifrasScoringClosest(t *testing.T) {
@@ -146,11 +150,10 @@ func TestGameRoomFinishCifrasScoringClosest(t *testing.T) {
 	c1 := &Client{ID: "c1", SendChan: make(chan types.ServerMessage, 10), Room: room}
 	c2 := &Client{ID: "c2", SendChan: make(chan types.ServerMessage, 10), Room: room}
 
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1}
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c2.ID, Client: c2}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1})
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c2.ID, Client: c2})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		room.State.State = types.StatePlaying
 		room.State.RoundType = types.RoundCifras
 		room.State.TargetNumber = 100
@@ -158,13 +161,11 @@ func TestGameRoomFinishCifrasScoringClosest(t *testing.T) {
 			c1.ID: {PlayerID: c1.ID, Name: "A", FinalNumber: 98, Distance: 2},
 			c2.ID: {PlayerID: c2.ID, Name: "B", FinalNumber: 95, Distance: 5},
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 
-	room.ActionChan <- GameAction{Type: "TIMEOUT"}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "TIMEOUT"})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		if c1.Player.Score != 7 {
 			t.Fatalf("expected c1 score 7, got %d", c1.Player.Score)
 		}
@@ -174,8 +175,7 @@ func TestGameRoomFinishCifrasScoringClosest(t *testing.T) {
 		if room.State.Winner != "A" {
 			t.Fatalf("expected winner A, got %s", room.State.Winner)
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 }
 
 func TestGameRoomFinishLetrasScoring(t *testing.T) {
@@ -186,11 +186,10 @@ func TestGameRoomFinishLetrasScoring(t *testing.T) {
 	c1 := &Client{ID: "c1", SendChan: make(chan types.ServerMessage, 10), Room: room}
 	c2 := &Client{ID: "c2", SendChan: make(chan types.ServerMessage, 10), Room: room}
 
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1}
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c2.ID, Client: c2}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1})
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c2.ID, Client: c2})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		room.State.State = types.StatePlaying
 		room.State.RoundType = types.RoundLetras
 		room.State.Letters = strings.Split("ABCDEFGHIJ", "")
@@ -198,13 +197,11 @@ func TestGameRoomFinishLetrasScoring(t *testing.T) {
 			c1.ID: {PlayerID: c1.ID, Name: "A", Word: "ABCDEFGHIJ"},
 			c2.ID: {PlayerID: c2.ID, Name: "B", Word: "ABCDE"},
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 
-	room.ActionChan <- GameAction{Type: "TIMEOUT"}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "TIMEOUT"})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		if c1.Player.Score != 10 {
 			t.Fatalf("expected c1 score 10, got %d", c1.Player.Score)
 		}
@@ -214,8 +211,7 @@ func TestGameRoomFinishLetrasScoring(t *testing.T) {
 		if room.State.Winner != "A" {
 			t.Fatalf("expected winner A, got %s", room.State.Winner)
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 }
 
 func TestGameRoomCheckAllReadyTimeout(t *testing.T) {
@@ -224,28 +220,23 @@ func TestGameRoomCheckAllReadyTimeout(t *testing.T) {
 	defer room.Shutdown()
 
 	c1 := &Client{ID: "c1", SendChan: make(chan types.ServerMessage, 10), Room: room}
-	room.ActionChan <- GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "JOIN", PlayerID: c1.ID, Client: c1})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		room.checkAllReady()
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		if room.timer != nil {
 			t.Fatalf("expected no timer with 1 player not ready")
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 
-	room.ActionChan <- GameAction{Type: "READY", PlayerID: c1.ID}
-	time.Sleep(50 * time.Millisecond)
+	sendSync(t, room, GameAction{Type: "READY", PlayerID: c1.ID})
 
-	room.ActionChan <- GameAction{Type: "SETUP", Extra: func() {
+	assertSync(t, room, func() {
 		if room.timer == nil {
 			t.Fatalf("expected timer started with 1 player ready")
 		}
-	}}
-	time.Sleep(50 * time.Millisecond)
+	})
 }
